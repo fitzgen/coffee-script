@@ -30,6 +30,22 @@ NEGATE  = -> @negated = not @negated; this
 # scope, and indentation level.
 exports.Base = class Base
 
+  # In order to support [source mapping][] for better debugging, we must do a
+  # little extra bookkeeping and maintain line and column information throughout
+  # the node of the AST. All subclasses of `Base` should take line and column
+  # parameters as the last parameters of their constructor's parameter list.
+  #
+  # [source mapping]: https://wiki.mozilla.org/DevTools/Features/SourceMap
+  constructor: (@line = null, @column = null) ->
+
+  # This is a utility method for nodes which need to create other nodes in the
+  # process of compilation and want to maintain the line and column information
+  # that they have without explicitly passing `@line` and `@column`, which can
+  # get very repetetive and verbose.
+  makeChild: (Ctor, args...) ->
+    node = Object.create Ctor.prototype
+    Ctor.apply(node, [@line, @column].concat args) or node
+
   # Common logic for determining whether to wrap this node in a closure before
   # compiling it, or to compile directly. We need to wrap if this node is a
   # *statement*, and it's not a *pureStatement*, and we're not at
@@ -62,8 +78,8 @@ exports.Base = class Base
       ref = if level then @compile o, level else this
       [ref, ref]
     else
-      ref = new Literal reused or o.scope.freeVariable 'ref'
-      sub = new Assign ref, this
+      ref = @makeChild Literal, reused or o.scope.freeVariable 'ref'
+      sub = @makeChild Assign, ref, this
       if level then [sub.compile(o, level), ref.value] else [sub, ref]
 
   # Compile to a source/variable pair suitable for looping.
@@ -77,7 +93,7 @@ exports.Base = class Base
   # Note that this is overridden for smarter behavior for
   # many statement nodes (e.g. If, For)...
   makeReturn: ->
-    new Return this
+    @makeChild Return, this
 
   # Does this node, or any of its children, contain a node of a certain kind?
   # Recursively traverses down the *children* of the nodes, yielding to a block
@@ -123,7 +139,7 @@ exports.Base = class Base
       child.traverseChildren crossScope, func
 
   invert: ->
-    new Op '!', this
+    @makeChild Op, '!', this
 
   unwrapAll: ->
     node = this
@@ -152,7 +168,8 @@ exports.Base = class Base
 # indented block of code -- the implementation of a function, a clause in an
 # `if`, `switch`, or `try`, and so on...
 exports.Block = class Block extends Base
-  constructor: (nodes) ->
+  constructor: (line, column, nodes) ->
+    super line, column
     @expressions = compact flatten nodes or []
 
   children: ['expressions']
@@ -236,7 +253,7 @@ exports.Block = class Block extends Base
   # clean up obvious double-parentheses.
   compileRoot: (o) ->
     o.indent = @tab = if o.bare then '' else TAB
-    o.scope  = new Scope null, this, null
+    o.scope  = new Scope null, this
     o.level  = LEVEL_TOP
     code     = @compileWithDeclarations o
     if o.bare then code else "(function() {\n#{code}\n}).call(this);\n"
@@ -268,9 +285,9 @@ exports.Block = class Block extends Base
 
   # Wrap up the given nodes as a **Block**, unless it already happens
   # to be one.
-  @wrap: (nodes) ->
+  @wrap: (nodes, line, column) ->
     return nodes[0] if nodes.length is 1 and nodes[0] instanceof Block
-    new Block nodes
+    new Block line, column, nodes
 
 #### Literal
 
@@ -278,10 +295,11 @@ exports.Block = class Block extends Base
 # JavaScript without translation, such as: strings, numbers,
 # `true`, `false`, `null`...
 exports.Literal = class Literal extends Base
-  constructor: (@value) ->
+  constructor: (line, column, @value) ->
+    super line, column
 
   makeReturn: ->
-    if @isStatement() then this else new Return this
+    if @isStatement() then this else @makeChild Return, this
 
   isAssignable: ->
     IDENTIFIER.test @value
@@ -315,7 +333,8 @@ exports.Literal = class Literal extends Base
 # A `return` is a *pureStatement* -- wrapping it in a closure wouldn't
 # make sense.
 exports.Return = class Return extends Base
-  constructor: (expr) ->
+  constructor: (line, column, expr) ->
+    super line, column
     @expression = expr if expr and not expr.unwrap().isUndefined
 
   children: ['expression']
@@ -336,7 +355,8 @@ exports.Return = class Return extends Base
 # A value, variable or literal or parenthesized, indexed or dotted into,
 # or vanilla.
 exports.Value = class Value extends Base
-  constructor: (base, props, tag) ->
+  constructor: (line, column, base, props, tag) ->
+    super line, column
     return base if not props and base instanceof Value
     @base       = base
     @properties = props or []
@@ -389,16 +409,16 @@ exports.Value = class Value extends Base
     name = last @properties
     if @properties.length < 2 and not @base.isComplex() and not name?.isComplex()
       return [this, this]  # `a` `a.b`
-    base = new Value @base, @properties[...-1]
+    base = @makeChild Value, @base, @properties[...-1]
     if base.isComplex()  # `a().b`
-      bref = new Literal o.scope.freeVariable 'base'
-      base = new Value new Parens new Assign bref, base
+      bref = @makeChild Literal, o.scope.freeVariable 'base'
+      base = @makeChild Value, @makeChild(Parens, @makeChild(Assign, bref, base))
     return [base, bref] unless name  # `a()`
     if name.isComplex()  # `a[b()]`
-      nref = new Literal o.scope.freeVariable 'name'
-      name = new Index new Assign nref, name.index
-      nref = new Index nref
-    [base.add(name), new Value(bref or base.base, [nref or name])]
+      nref = @makeChild Literal, o.scope.freeVariable 'name'
+      name = @makeChild Index, @makeChild Assign, nref, name.index
+      nref = @makeChild Index, nref
+    [base.add(name), @makeChild(Value, bref or base.base, [nref or name])]
 
   # We compile a value to JavaScript by compiling and joining each property.
   # Things get much more interesting if the chain of properties has *soak*
@@ -421,13 +441,13 @@ exports.Value = class Value extends Base
         return ifn
       for prop, i in @properties when prop.soak
         prop.soak = off
-        fst = new Value @base, @properties[...i]
-        snd = new Value @base, @properties[i..]
+        fst = @makeChild Value, @base, @properties[...i]
+        snd = @makeChild Value, @base, @properties[i..]
         if fst.isComplex()
-          ref = new Literal o.scope.freeVariable 'ref'
-          fst = new Parens new Assign ref, fst
+          ref = @makeChild Literal, o.scope.freeVariable 'ref'
+          fst = @makeChild Parens, @makeChild Assign, ref, fst
           snd.base = ref
-        return new If new Existence(fst), snd, soak: on
+        return @makeChild If, @makeChild(Existence, fst), snd, soak: on
       null
     @unfoldedSoak = result or no
 
@@ -451,7 +471,8 @@ exports.Comment = class Comment extends Base
 # Node for a function invocation. Takes care of converting `super()` calls into
 # calls against the prototype's function of the same name.
 exports.Call = class Call extends Base
-  constructor: (variable, @args = [], @soak) ->
+  constructor: (line, column, variable, @args = [], @soak) ->
+    super line, column
     @isNew    = false
     @isSuper  = variable is 'super'
     @variable = if @isSuper then null else variable
@@ -475,10 +496,10 @@ exports.Call = class Call extends Base
     {name} = method
     throw SyntaxError 'cannot call super on an anonymous function.' unless name?
     if method.klass
-      accesses = [new Access(new Literal '__super__')]
-      accesses.push new Access new Literal 'constructor' if method.static
-      accesses.push new Access new Literal name
-      (new Value (new Literal method.klass), accesses).compile o
+      accesses = [@makeChild Access, @makeChild(Literal, '__super__')]
+      accesses.push @makeChild Access, @makeChild(Literal, 'constructor') if method.static
+      accesses.push @makeChild Access, @makeChild(Literal, name)
+      @makeChild(Value, @makeChild(Literal, method.klass), accesses).compile o
     else
       "#{name}.__super__.constructor"
 
@@ -487,14 +508,14 @@ exports.Call = class Call extends Base
     if @soak
       if @variable
         return ifn if ifn = unfoldSoak o, this, 'variable'
-        [left, rite] = new Value(@variable).cacheReference o
+        [left, rite] = @makeChild(Value, @variable).cacheReference o
       else
-        left = new Literal @superReference o
-        rite = new Value left
-      rite = new Call rite, @args
+        left = @makeChild Literal, @superReference o
+        rite = @makeChild Value, left
+      rite = @makeChild Call, rite, @args
       rite.isNew = @isNew
-      left = new Literal "typeof #{ left.compile o } === \"function\""
-      return new If left, new Value(rite), soak: yes
+      left = @makeChild Literal, "typeof #{ left.compile o } === \"function\""
+      return @makeChild If, left, @makeChild(Value, rite), soak: yes
     call = this
     list = []
     loop
@@ -525,7 +546,7 @@ exports.Call = class Call extends Base
       obj = null
       for prop in node.base.properties
         if prop instanceof Assign or prop instanceof Comment
-          nodes.push obj = new Obj properties = [], true if not obj
+          nodes.push obj = @makeChild Obj, properties = [], true if not obj
           properties.push prop
         else
           nodes.push prop
@@ -564,7 +585,7 @@ exports.Call = class Call extends Base
         #{idt}return typeof result === "object" ? result : child;
         #{@tab}})(#{ @variable.compile o, LEVEL_LIST }, #{splatArgs}, function() {})
       """
-    base = new Value @variable
+    base = @makeChild Value, @variable
     if (name = base.properties.pop()) and base.isComplex()
       ref = o.scope.freeVariable 'ref'
       fun = "(#{ref} = #{ base.compile o, LEVEL_LIST })#{ name.compile o }"
@@ -584,21 +605,23 @@ exports.Call = class Call extends Base
 # After `goog.inherits` from the
 # [Closure Library](http://closure-library.googlecode.com/svn/docs/closureGoogBase.js.html).
 exports.Extends = class Extends extends Base
-  constructor: (@child, @parent) ->
+  constructor: (line, column, @child, @parent) ->
+    super line, column
 
   children: ['child', 'parent']
 
   # Hooks one constructor into another's prototype chain.
   compile: (o) ->
     utility 'hasProp'
-    new Call(new Value(new Literal utility 'extends'), [@child, @parent]).compile o
+    @makeChild(Call, @makeChild(Value, @makeChild(Literal, utility 'extends')), [@child, @parent]).compile o
 
 #### Access
 
 # A `.` access into a property of a value, or the `::` shorthand for
 # an access into the object's prototype.
 exports.Access = class Access extends Base
-  constructor: (@name, tag) ->
+  constructor: (line, column, @name, tag) ->
+    super line, column
     @name.asKey = yes
     @soak  = tag is 'soak'
 
@@ -614,7 +637,8 @@ exports.Access = class Access extends Base
 
 # A `[ ... ]` indexed access into an array or object.
 exports.Index = class Index extends Base
-  constructor: (@index) ->
+  constructor: (line, column, @index) ->
+    super line, column
 
   children: ['index']
 
@@ -633,7 +657,8 @@ exports.Range = class Range extends Base
 
   children: ['from', 'to']
 
-  constructor: (@from, @to, tag) ->
+  constructor: (line, column, @from, @to, tag) ->
+    super line, column
     @exclusive = tag is 'exclusive'
     @equals = if @exclusive then '' else '='
 
@@ -714,7 +739,8 @@ exports.Slice = class Slice extends Base
 
   children: ['range']
 
-  constructor: (@range) ->
+  constructor: (line, column, @range) ->
+    super line, column
     super()
 
   # We have to be careful when trying to slice through the end of the array,
@@ -737,7 +763,8 @@ exports.Slice = class Slice extends Base
 
 # An object literal, nothing fancy.
 exports.Obj = class Obj extends Base
-  constructor: (props, @generated = false) ->
+  constructor: (line, column, props, @generated = false) ->
+    super line, column
     @objects = @properties = props or []
 
   children: ['properties']
@@ -759,10 +786,10 @@ exports.Obj = class Obj extends Base
         ',\n'
       indent = if prop instanceof Comment then '' else idt
       if prop instanceof Value and prop.this
-        prop = new Assign prop.properties[0].name, prop, 'object'
+        prop = @makeChild Assign, prop.properties[0].name, prop, 'object'
       if prop not instanceof Comment
         if prop not instanceof Assign
-          prop = new Assign prop, prop, 'object'
+          prop = @makeChild Assign, prop, prop, 'object'
         (prop.variable.base or prop.variable).asKey = yes
       indent + prop.compile(o, LEVEL_TOP) + join
     props = props.join ''
@@ -777,7 +804,8 @@ exports.Obj = class Obj extends Base
 
 # An array literal.
 exports.Arr = class Arr extends Base
-  constructor: (objs) ->
+  constructor: (line, column, objs) ->
+    super line, column
     @objects = objs or []
 
   children: ['objects']
@@ -805,7 +833,8 @@ exports.Arr = class Arr extends Base
 # Initialize a **Class** with its name, an optional superclass, and a
 # list of prototype property assignments.
 exports.Class = class Class extends Base
-  constructor: (@variable, @parent, @body = new Block) ->
+  constructor: (line, column, @variable, @parent, @body = @makeChild(Block, [])) ->
+    super line, column
     @boundFuncs = []
     @body.classBody = yes
 
@@ -836,8 +865,8 @@ exports.Class = class Class extends Base
   addBoundFunctions: (o) ->
     if @boundFuncs.length
       for bvar in @boundFuncs
-        lhs = (new Value (new Literal "this"), [new Access bvar]).compile o
-        @ctor.body.unshift new Literal "#{lhs} = #{utility 'bind'}(#{lhs}, this)"
+        lhs = @makeChild(Value, @makeChild(Literal, "this"), [@makeChild Access, bvar]).compile o
+        @ctor.body.unshift @makeChild Literal, "#{lhs} = #{utility 'bind'}(#{lhs}, this)"
 
   # Merge the properties from a top-level object as prototypal properties
   # on the class.
@@ -857,12 +886,12 @@ exports.Class = class Class extends Base
             assign = @ctor = func
           else
             @externalCtor = o.scope.freeVariable 'class'
-            assign = new Assign new Literal(@externalCtor), func
+            assign = @makeChild Assign, @makeChild(Literal, @externalCtor), func
         else
           if assign.variable.this
             func.static = yes
           else
-            assign.variable = new Value(new Literal(name), [(new Access new Literal 'prototype'), new Access base ])
+            assign.variable = @makeChild Value, @makeChild(Literal, name), [@makeChild(Access, @makeChild(Literal, 'prototype')), @makeChild(Access, base) ]
             if func instanceof Code and func.bound
               @boundFuncs.push base
               func.bound = no
@@ -883,9 +912,9 @@ exports.Class = class Class extends Base
   # configured.
   ensureConstructor: (name) ->
     if not @ctor
-      @ctor = new Code
-      @ctor.body.push new Literal "#{name}.__super__.constructor.apply(this, arguments)" if @parent
-      @ctor.body.push new Literal "#{@externalCtor}.apply(this, arguments)" if @externalCtor
+      @ctor = @makeChild Code
+      @ctor.body.push @makeChild Literal, "#{name}.__super__.constructor.apply(this, arguments)" if @parent
+      @ctor.body.push @makeChild Literal, "#{@externalCtor}.apply(this, arguments)" if @externalCtor
       @body.expressions.unshift @ctor
     @ctor.ctor     = @ctor.name = name
     @ctor.klass    = null
@@ -898,18 +927,18 @@ exports.Class = class Class extends Base
     decl  = @determineName()
     name  = decl or @name or '_Class'
     name = "_#{name}" if name.reserved
-    lname = new Literal name
+    lname = @makeChild Literal, name
 
     @setContext name
     @walkBody name, o
     @ensureConstructor name
-    @body.expressions.unshift new Extends lname, @parent if @parent
+    @body.expressions.unshift @makeChild Extends, lname, @parent if @parent
     @body.expressions.unshift @ctor unless @ctor instanceof Code
     @body.expressions.push lname
     @addBoundFunctions o
 
-    klass = new Parens Closure.wrap(@body), true
-    klass = new Assign @variable, klass if @variable
+    klass = @makeChild Parens, Closure.wrap(@body, true)
+    klass = @makeChild Assign, @variable, klass if @variable
     klass.compile o
 
 #### Assign
@@ -917,7 +946,8 @@ exports.Class = class Class extends Base
 # The **Assign** is used to assign a local variable to value, or to set the
 # property of an object -- including within object literals.
 exports.Assign = class Assign extends Base
-  constructor: (@variable, @value, @context, options) ->
+  constructor: (line, column, @variable, @value, @context, options) ->
+    super line, column
     @param = options and options.param
 
   children: ['variable', 'value']
@@ -974,18 +1004,21 @@ exports.Assign = class Assign extends Base
         {variable: {base: idx}, value: obj} = obj
       else
         if obj.base instanceof Parens
-          [obj, idx] = new Value(obj.unwrapAll()).cacheReference o
+          [obj, idx] = @makeChild(Value, obj.unwrapAll()).cacheReference o
         else
           idx = if isObject
             if obj.this then obj.properties[0].name else obj
           else
-            new Literal 0
+            @makeChild Literal, 0
       acc   = IDENTIFIER.test idx.unwrap().value or 0
-      value = new Value value
-      value.properties.push new (if acc then Access else Index) idx
+      value = @makeChild Value, value
+      value.properties.push(if acc
+        @makeChild Access, idx
+      else
+        @makeChild Index, idx)
       if obj.unwrap().value in ['arguments','eval'].concat RESERVED
         throw new SyntaxError "assignment to a reserved word: #{obj.compile o} = #{value.compile o}"
-      return new Assign(obj, value, null, param: @param).compile o, LEVEL_TOP
+      return @makeChild(Assign, obj, value, null, param: @param).compile o, LEVEL_TOP
     vvar    = value.compile o, LEVEL_LIST
     assigns = []
     splat   = false
@@ -1002,7 +1035,7 @@ exports.Assign = class Assign extends Base
         else
           # A shorthand `{a, b, @c} = val` pattern-match.
           if obj.base instanceof Parens
-            [obj, idx] = new Value(obj.unwrapAll()).cacheReference o
+            [obj, idx] = @makeChild(Value, obj.unwrapAll()).cacheReference o
           else
             idx = if obj.this then obj.properties[0].name else obj
       if not splat and obj instanceof Splat
@@ -1013,7 +1046,7 @@ exports.Assign = class Assign extends Base
           val += ", #{ivar} = #{vvar}.length - #{rest}) : (#{ivar} = #{i}, [])"
         else
           val += ") : []"
-        val   = new Literal val
+        val   = @makeChild Literal, val
         splat = "#{ivar}++"
       else
         name = obj.unwrap().value
@@ -1022,14 +1055,14 @@ exports.Assign = class Assign extends Base
           throw new SyntaxError \
             "multiple splats are disallowed in an assignment: #{obj}..."
         if typeof idx is 'number'
-          idx = new Literal splat or idx
+          idx = @makeChild Literal, splat or idx
           acc = no
         else
           acc = isObject and IDENTIFIER.test idx.unwrap().value or 0
-        val = new Value new Literal(vvar), [new (if acc then Access else Index) idx]
+        val = @makeChild Value, @makeChild(Literal, vvar), [if acc then @makeChild(Access, idx) else @makeChild(Index, idx)]
       if name? and name in ['arguments','eval'].concat RESERVED
         throw new SyntaxError "assignment to a reserved word: #{obj.compile o} = #{val.compile o}"
-      assigns.push new Assign(obj, val, null, param: @param).compile o, LEVEL_TOP
+      assigns.push @makeChild(Assign, obj, val, null, param: @param).compile o, LEVEL_TOP
     assigns.push vvar unless top
     code = assigns.join ', '
     if o.level < LEVEL_LIST then code else "(#{code})"
@@ -1040,7 +1073,7 @@ exports.Assign = class Assign extends Base
   compileConditional: (o) ->
     [left, rite] = @variable.cacheReference o
     if "?" in @context then o.isExistentialEquals = true
-    new Op(@context[0...-1], left, new Assign(rite, @value, '=') ).compile o
+    @makeChild( Op, @context[0...-1], left, @makeChild(Assign, rite, @value, '=') ).compile o
 
   # Compile the assignment from an array splice literal, using JavaScript's
   # `Array#splice` method.
@@ -1067,9 +1100,10 @@ exports.Assign = class Assign extends Base
 # When for the purposes of walking the contents of a function body, the Code
 # has no *children* -- they're within the inner scope.
 exports.Code = class Code extends Base
-  constructor: (params, body, tag) ->
+  constructor: (line, column, params, body, tag) ->
+    super line, column
     @params  = params or []
-    @body    = body or new Block
+    @body    = body or @makeChild Block, []
     @bound   = tag is 'boundfunc'
     @context = 'this' if @bound
 
@@ -1093,20 +1127,19 @@ exports.Code = class Code extends Base
     exprs  = []
     for param in @params when param.splat
       o.scope.add p.name.value, 'var', yes for p in @params when p.name.value
-      splats = new Assign new Value(new Arr(p.asReference o for p in @params)),
-                          new Value new Literal 'arguments'
+      splats = @makeChild Assign, @makeChild(Value, @makeChild(Arr, p.asReference o for p in @params)), @makeChild(Value, @makeChild(Literal, 'arguments'))
       break
     for param in @params
       if param.isComplex()
         val = ref = param.asReference o
-        val = new Op '?', ref, param.value if param.value
-        exprs.push new Assign new Value(param.name), val, '=', param: yes
+        val = @makeChild Op, '?', ref, param.value if param.value
+        exprs.push @makeChild Assign, @makeChild(Value, param.name), val, '=', param: yes
       else
         ref = param
         if param.value
-          lit = new Literal ref.name.value + ' == null'
-          val = new Assign new Value(param.name), param.value, '='
-          exprs.push new If lit, val
+          lit = @makeChild Literal, ref.name.value + ' == null'
+          val = @makeChild Assign, @makeChild(Value, param.name), param.value, '='
+          exprs.push @makeChild If, lit, val
       vars.push ref unless splats
     wasEmpty = @body.isEmpty()
     exprs.unshift splats if splats
@@ -1134,7 +1167,8 @@ exports.Code = class Code extends Base
 # these parameters can also attach themselves to the context of the function,
 # as well as be a splat, gathering up a group of parameters into an array.
 exports.Param = class Param extends Base
-  constructor: (@name, @value, @splat) ->
+  constructor: (line, column, @name, @value, @splat) ->
+    super line, column
 
   children: ['name', 'value']
 
@@ -1146,11 +1180,11 @@ exports.Param = class Param extends Base
     node = @name
     if node.this
       node = node.properties[0].name
-      node = new Literal '_' + node.value if node.value.reserved
+      node = @makeChild Literal, '_' + node.value if node.value.reserved
     else if node.isComplex()
-      node = new Literal o.scope.freeVariable 'arg'
-    node = new Value node
-    node = new Splat node if @splat
+      node = @makeChild Literal, o.scope.freeVariable 'arg'
+    node = @makeChild Value, node
+    node = @makeChild Splat, node if @splat
     @reference = node
 
   isComplex: ->
@@ -1166,8 +1200,9 @@ exports.Splat = class Splat extends Base
 
   isAssignable: YES
 
-  constructor: (name) ->
-    @name = if name.compile then name else new Literal name
+  constructor: (line, column, name) ->
+    super line, column
+    @name = if name.compile then name else @makeChild Literal, name
 
   assigns: (name) ->
     @name.assigns name
@@ -1201,7 +1236,8 @@ exports.Splat = class Splat extends Base
 # it, all other loops can be manufactured. Useful in cases where you need more
 # flexibility or more speed than a comprehension can provide.
 exports.While = class While extends Base
-  constructor: (condition, options) ->
+  constructor: (line, column, condition, options) ->
+    super line, column
     @condition = if options?.invert then condition.invert() else condition
     @guard     = options?.guard
 
@@ -1236,12 +1272,12 @@ exports.While = class While extends Base
       if o.level > LEVEL_TOP or @returns
         rvar = o.scope.freeVariable 'results'
         set  = "#{@tab}#{rvar} = [];\n"
-        body = Push.wrap rvar, body if body
+        body = Push.wrap rvar, (body if body), this
       if @guard
         if body.expressions.length > 1
-          body.expressions.unshift new If (new Parens @guard).invert(), new Literal "continue"
+          body.expressions.unshift @makeChild If, @makeChild(Parens, @guard).invert(), @makeChild(Literal, "continue")
         else
-          body = Block.wrap [new If @guard, body] if @guard
+          body = Block.wrap [@makeChild If, @guard, body], @line, @column if @guard
       body = "\n#{ body.compile o, LEVEL_TOP }\n#{@tab}"
     code = set + @tab + "while (#{ @condition.compile o, LEVEL_PAREN }) {#{body}}"
     if @returns
@@ -1253,15 +1289,16 @@ exports.While = class While extends Base
 # Simple Arithmetic and logical operations. Performs some conversion from
 # CoffeeScript operations into their JavaScript equivalents.
 exports.Op = class Op extends Base
-  constructor: (op, first, second, flip ) ->
-    return new In first, second if op is 'in'
+  constructor: (line, column, op, first, second, flip) ->
+    super line, column
+    return @makeChild In, first, second if op is 'in'
     if op is 'do'
-      call = new Call first, first.params or []
+      call = @makeChild Call, first, first.params or []
       call.do = yes
       return call
     if op is 'new'
       return first.newInstance() if first instanceof Call and not first.do and not first.isNew
-      first = new Parens first   if first instanceof Code and first.bound or first.do
+      first = @makeChild Parens, first if first instanceof Code and first.bound or first.do
     @operator = CONVERSIONS[op] or op
     @first    = first
     @second   = second
@@ -1301,7 +1338,7 @@ exports.Op = class Op extends Base
       while curr and curr.operator
         allInvertable and= (curr.operator of INVERSIONS)
         curr = curr.first
-      return new Parens(this).invert() unless allInvertable
+      return @makeChild(Parens, this).invert() unless allInvertable
       curr = this
       while curr and curr.operator
         curr.invert = !curr.invert
@@ -1314,19 +1351,19 @@ exports.Op = class Op extends Base
         @first.invert()
       this
     else if @second
-      new Parens(this).invert()
+      @makeChild(Parens, this).invert()
     else if @operator is '!' and (fst = @first.unwrap()) instanceof Op and
                                   fst.operator in ['!', 'in', 'instanceof']
       fst
     else
-      new Op '!', this
+      @makeChild Op, '!', this
 
   unfoldSoak: (o) ->
     @operator in ['++', '--', 'delete'] and unfoldSoak o, this, 'first'
 
-  compileNode: (o) ->    
+  compileNode: (o) ->
     isChain = @isChainable() and @first.isChainable()
-    # In chains, there's no need to wrap bare obj literals in parens, 
+    # In chains, there's no need to wrap bare obj literals in parens,
     # as the chained expression is wrapped.
     @first.front = @front unless isChain
     return @compileUnary     o if @isUnary()
@@ -1349,19 +1386,19 @@ exports.Op = class Op extends Base
 
   compileExistence: (o) ->
     if @first.isComplex()
-      ref = new Literal o.scope.freeVariable 'ref'
-      fst = new Parens new Assign ref, @first
+      ref = @makeChild Literal, o.scope.freeVariable 'ref'
+      fst = @makeChild Parens, @makeChild Assign, ref, @first
     else
       fst = @first
       ref = fst
-    new If(new Existence(fst), ref, type: 'if').addElse(@second).compile o
+    @makeChild(If, @makeChild(Existence, fst), ref, type: 'if').addElse(@second).compile o
 
   # Compile a unary **Op**.
   compileUnary: (o) ->
     parts = [op = @operator]
     parts.push ' ' if op in ['new', 'typeof', 'delete'] or
                       op in ['+', '-'] and @first instanceof Op and @first.operator is op
-    @first = new Parens @first if op is 'new' and @first.isStatement o
+    @first = @makeChild Parens, @first if op is 'new' and @first.isStatement o
     parts.push @first.compile o, LEVEL_OP
     parts.reverse() if @flip
     parts.join ''
@@ -1371,7 +1408,8 @@ exports.Op = class Op extends Base
 
 #### In
 exports.In = class In extends Base
-  constructor: (@object, @array) ->
+  constructor: (line, column, @object, @array) ->
+    super line, column
 
   children: ['object', 'array']
 
@@ -1410,7 +1448,8 @@ exports.In = class In extends Base
 
 # A classic *try/catch/finally* block.
 exports.Try = class Try extends Base
-  constructor: (@attempt, @error, @recovery, @ensure) ->
+  constructor: (line, column, @attempt, @error, @recovery, @ensure) ->
+    super line, column
 
   children: ['attempt', 'recovery', 'ensure']
 
@@ -1429,15 +1468,15 @@ exports.Try = class Try extends Base
     o.indent  += TAB
     errorPart = if @error then " (#{ @error.compile o }) " else ' '
     tryPart   = @attempt.compile o, LEVEL_TOP
-    
+
     catchPart = if @recovery
       o.scope.add @error.value, 'param' unless o.scope.check @error.value
       " catch#{errorPart}{\n#{ @recovery.compile o, LEVEL_TOP }\n#{@tab}}"
     else unless @ensure or @recovery
       ' catch (_error) {}'
-      
+
     ensurePart = if @ensure then " finally {\n#{ @ensure.compile o, LEVEL_TOP }\n#{@tab}}" else ''
-      
+
     """#{@tab}try {
     #{tryPart}
     #{@tab}}#{ catchPart or '' }#{ensurePart}"""
@@ -1446,7 +1485,8 @@ exports.Try = class Try extends Base
 
 # Simple node to throw an exception.
 exports.Throw = class Throw extends Base
-  constructor: (@expression) ->
+  constructor: (line, column, @expression) ->
+    super line, column
 
   children: ['expression']
 
@@ -1465,7 +1505,8 @@ exports.Throw = class Throw extends Base
 # similar to `.nil?` in Ruby, and avoids having to consult a JavaScript truth
 # table.
 exports.Existence = class Existence extends Base
-  constructor: (@expression) ->
+  constructor: (line, column, @expression) ->
+    super line, column
 
   children: ['expression']
 
@@ -1490,7 +1531,8 @@ exports.Existence = class Existence extends Base
 #
 # Parentheses are a good way to force any statement to become an expression.
 exports.Parens = class Parens extends Base
-  constructor: (@body) ->
+  constructor: (line, column, @body) ->
+    super line, column
 
   children: ['body']
 
@@ -1518,9 +1560,10 @@ exports.Parens = class Parens extends Base
 # the current index of the loop as a second parameter. Unlike Ruby blocks,
 # you can map and filter in a single pass.
 exports.For = class For extends Base
-  constructor: (body, source) ->
+  constructor: (line, column, body, source) ->
+    super line, column
     {@source, @guard, @step, @name, @index} = source
-    @body    = Block.wrap [body]
+    @body    = Block.wrap [body], @line, @column
     @own     = !!source.own
     @object  = !!source.object
     [@name, @index] = [@index, @name] if @object
@@ -1546,7 +1589,7 @@ exports.For = class For extends Base
   # comprehensions. Some of the generated code can be shared in common, and
   # some cannot.
   compileNode: (o) ->
-    body      = Block.wrap [@body]
+    body      = Block.wrap [@body], @line, @column
     lastJumps = last(body.expressions)?.jumps()
     @returns  = no if lastJumps and lastJumps instanceof Return
     source    = if @range then @source.base else @source
@@ -1581,14 +1624,14 @@ exports.For = class For extends Base
     if @returns
       resultPart   = "#{@tab}#{rvar} = [];\n"
       returnResult = "\n#{@tab}return #{rvar};"
-      body         = Push.wrap rvar, body
+      body         = Push.wrap rvar, body, this
     if @guard
       if body.expressions.length > 1
-        body.expressions.unshift new If (new Parens @guard).invert(), new Literal "continue"
+        body.expressions.unshift @makeChild If, @makeChild(Parens, @guard).invert(), @makeChild(Literal, "continue")
       else
-        body = Block.wrap [new If @guard, body] if @guard
+        body = Block.wrap [@makeChild If, @guard, body], @line, @column if @guard
     if @pattern
-      body.expressions.unshift new Assign @name, new Literal "#{svar}[#{ivar}]"
+      body.expressions.unshift @makeChild Assign, @name, @makeChild(Literal, "#{svar}[#{ivar}]")
     defPart     += @pluckDirectCall o, body
     varPart     = "\n#{idt1}#{namePart};" if namePart
     if @object
@@ -1612,19 +1655,20 @@ exports.For = class For extends Base
                       val.properties.length is 1 and
                       val.properties[0].name?.value in ['call', 'apply'])
       fn    = val.base?.unwrapAll() or val
-      ref   = new Literal o.scope.freeVariable 'fn'
-      base  = new Value ref
+      ref   = @makeChild Literal, o.scope.freeVariable 'fn'
+      base  = @makeChild Value, ref
       if val.base
         [val.base, base] = [base, val]
-      body.expressions[idx] = new Call base, expr.args
-      defs += @tab + new Assign(ref, fn).compile(o, LEVEL_TOP) + ';\n'
+      body.expressions[idx] = @makeChild Call, base, expr.args
+      defs += @tab + @makeChild(Assign, ref, fn).compile(o, LEVEL_TOP) + ';\n'
     defs
 
 #### Switch
 
 # A JavaScript *switch* statement. Converts into a returnable expression on-demand.
 exports.Switch = class Switch extends Base
-  constructor: (@subject, @cases, @otherwise) ->
+  constructor: (line, column, @subject, @cases, @otherwise) ->
+    super line, column
 
   children: ['subject', 'cases', 'otherwise']
 
@@ -1664,7 +1708,8 @@ exports.Switch = class Switch extends Base
 # Single-expression **Ifs** are compiled into conditional operators if possible,
 # because ternaries are already proper expressions, and don't need conversion.
 exports.If = class If extends Base
-  constructor: (condition, @body, options = {}) ->
+  constructor: (line, column, condition, @body, options = {}) ->
+    super line, column
     @condition = if options.type is 'unless' then condition.invert() else condition
     @elseBody  = null
     @isChain   = false
@@ -1696,12 +1741,12 @@ exports.If = class If extends Base
     if @isStatement o then @compileStatement o else @compileExpression o
 
   makeReturn: ->
-    @body     and= new Block [@body.makeReturn()]
-    @elseBody and= new Block [@elseBody.makeReturn()]
+    @body     and= @ensureBlock @body.makeReturn()
+    @elseBody and= @ensureBlock @elseBody.makeReturn()
     this
 
   ensureBlock: (node) ->
-    if node instanceof Block then node else new Block [node]
+    if node instanceof Block then node else @makeChild(Block, [node])
 
   # Compile the `If` as a regular *if-else* statement. Flattened chains
   # force inner *else* bodies into statement form.
@@ -1710,7 +1755,7 @@ exports.If = class If extends Base
     exeq     = del o, 'isExistentialEquals'
 
     if exeq
-      return new If(@condition.invert(), @elseBodyNode(), type: 'if').compile o
+      return @makeChild(If, @condition.invert(), @elseBodyNode(), type: 'if').compile o
 
     cond     = @condition.compile o, LEVEL_PAREN
     o.indent += TAB
@@ -1756,9 +1801,9 @@ exports.If = class If extends Base
 # The **Push** creates the tree for `array.push(value)`,
 # which is helpful for recording the result arrays from comprehensions.
 Push =
-  wrap: (name, exps) ->
+  wrap: (name, exps, parent) ->
     return exps if exps.isEmpty() or last(exps.expressions).jumps()
-    exps.push new Call new Value(new Literal(name), [new Access new Literal 'push']), [exps.pop()]
+    exps.push parent.makeChild Call, parent.makeChild(Value, parent.makeChild(Literal, name), [parent.makeChild Access, parent.makeChild(Literal, 'push')]), [exps.pop()]
 
 #### Closure
 
@@ -1770,16 +1815,16 @@ Closure =
   # then make sure that the closure wrapper preserves the original values.
   wrap: (expressions, statement, noReturn) ->
     return expressions if expressions.jumps()
-    func = new Code [], Block.wrap [expressions]
+    func = expressions.makeChild Code, [], Block.wrap([expressions], expressions.line, expressions.column)
     args = []
     if (mentionsArgs = expressions.contains @literalArgs) or expressions.contains @literalThis
-      meth = new Literal if mentionsArgs then 'apply' else 'call'
-      args = [new Literal 'this']
-      args.push new Literal 'arguments' if mentionsArgs
-      func = new Value func, [new Access meth]
+      meth = expressions.makeChild(Literal, if mentionsArgs then 'apply' else 'call')
+      args = [expressions.makeChild Literal, 'this']
+      args.push expressions.makeChild Literal, 'arguments' if mentionsArgs
+      func = expressions.makeChild Value, func, [expressions.makeChild Access, meth]
     func.noReturn = noReturn
-    call = new Call func, args
-    if statement then Block.wrap [call] else call
+    call = expressions.makeChild Call, func, args
+    if statement then Block.wrap [call], expressions.line, expressions.column else call
 
   literalArgs: (node) ->
     node instanceof Literal and node.value is 'arguments' and not node.asKey
@@ -1791,7 +1836,7 @@ Closure =
 unfoldSoak = (o, parent, name) ->
   return unless ifn = parent[name].unfoldSoak o
   parent[name] = ifn.body
-  ifn.body = new Value parent
+  ifn.body = parent.makeChild Value, parent
   ifn
 
 # Constants

@@ -833,8 +833,9 @@ exports.Arr = class Arr extends Base
 # Initialize a **Class** with its name, an optional superclass, and a
 # list of prototype property assignments.
 exports.Class = class Class extends Base
-  constructor: (line, column, @variable, @parent, @body = @makeChild(Block, [])) ->
+  constructor: (line, column, @variable, @parent, @body) ->
     super line, column
+    @body or= @makeChild(Block, [])
     @boundFuncs = []
     @body.classBody = yes
 

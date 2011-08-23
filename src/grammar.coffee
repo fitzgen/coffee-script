@@ -135,8 +135,8 @@ grammar =
 
   # Assignment of a variable, property, or index to a value.
   Assign: [
-    o 'Assignable = Expression',                -> new Assign @$$.first_line, @$$.first_column, $1, $3
-    o 'Assignable = INDENT Expression OUTDENT', -> new Assign @$$.first_line, @$$.first_column, $1, $4
+    o 'Assignable = Expression',                -> new Assign @$2.first_line, @$2.first_column, $1, $3
+    o 'Assignable = INDENT Expression OUTDENT', -> new Assign @$2.first_line, @$2.first_column, $1, $4
   ]
 
   # Assignment when it happens within an object literal. The difference from

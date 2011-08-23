@@ -35,13 +35,18 @@ exports.Lexer = class Lexer
     code     = "\n#{code}" if WHITESPACE.test code
     code     = code.replace(/\r/g, '').replace TRAILING_SPACES, ''
 
-    @code    = code           # The remainder of the source code.
-    @line    = opts.line or 0 # The current line.
-    @indent  = 0              # The current indentation level.
-    @indebt  = 0              # The over-indentation at the current level.
-    @outdebt = 0              # The under-outdentation at the current level.
-    @indents = []             # The stack of all current indentation levels.
-    @tokens  = []             # Stream of parsed tokens in the form `['TYPE', value, line]`.
+    @code    = code             # The remainder of the source code.
+    @line    = opts.line or 0   # The current line.
+    @column  = opts.column or 0 # The current line.
+    @indent  = 0                # The current indentation level.
+    @indebt  = 0                # The over-indentation at the current level.
+    @outdebt = 0                # The under-outdentation at the current level.
+    @indents = []               # The stack of all current indentation levels.
+    @tokens  = []               # Stream of parsed tokens in the form `['TYPE', value, line]`.
+
+    # We keep an array of the indices of newlines so that we can easily compute
+    # column offset given an index in to the whole code string.
+    @lineStartIndices = [0].concat(i + 1 for i in [0...code.length] when code.charAt(i) is '\n')
 
     # At every position, run through this list of attempted matches,
     # short-circuiting if any of them succeed. Their order determines precedence:
@@ -58,6 +63,7 @@ exports.Lexer = class Lexer
            @regexToken()      or
            @jsToken()         or
            @literalToken()
+      @updateColumn i, code
 
     @closeIndentation()
     return @tokens if opts.rewrite is off
@@ -472,9 +478,21 @@ exports.Lexer = class Lexer
   # Helpers
   # -------
 
-  # Add a token to the results, taking note of the line number.
+  # Save the current column position.
+  updateColumn: (i, code) ->
+    # Right now we are just doing a linear search because it is simple, but if
+    # tokenizing is found to be a performance bottleneck and this linear search
+    # is the cause of it, we could rewrite this to use binary search.
+    j = 0
+    len = @lineStartIndices.length
+    while i >= @lineStartIndices[j] and j < len
+      currentLine = @lineStartIndices[j]
+      j++
+    @column = i - currentLine
+
+  # Add a token to the results, taking note of the line and column numbers.
   token: (tag, value) ->
-    @tokens.push [tag, value, @line]
+    @tokens.push [tag, value, @line, @column]
 
   # Peek at a tag in the current token stream.
   tag: (index, tag) ->
